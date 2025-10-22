@@ -207,6 +207,134 @@ If port 5050 is occupied:
 - Audio Codec: AAC
 - Pixel Format: YUV420P (widely compatible)
 
+## YouTube Live Streaming
+
+Stream your rendered videos directly to YouTube Live! This feature allows you to create lofi music livestreams that loop indefinitely.
+
+### Setup YouTube Integration
+
+#### 1. Create Google Cloud Project
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select an existing one
+3. Enable the **YouTube Data API v3**:
+   - Navigate to "APIs & Services" > "Library"
+   - Search for "YouTube Data API v3"
+   - Click "Enable"
+
+#### 2. Create OAuth 2.0 Credentials
+
+1. Go to "APIs & Services" > "Credentials"
+2. Click "Create Credentials" > "OAuth client ID"
+3. Configure OAuth consent screen if prompted:
+   - User Type: External
+   - App name: "Lofi Mixer Studio" (or your choice)
+   - Add your email as developer contact
+   - Scopes: Add `https://www.googleapis.com/auth/youtube.force-ssl`
+4. Create OAuth client ID:
+   - Application type: **Web application**
+   - Name: "Lofi Mixer Studio"
+   - Authorized redirect URIs: `http://127.0.0.1:5050/oauth2callback`
+5. Download the JSON credentials file
+
+#### 3. Configure Application
+
+1. Rename the example config file:
+   ```bash
+   cp youtube_config.example.json youtube_config.json
+   ```
+
+2. Open `youtube_config.json` and paste your OAuth credentials from the downloaded JSON file
+
+3. Install YouTube API dependencies:
+   ```bash
+   pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client
+   ```
+
+4. Restart the Flask server
+
+### Using YouTube Streaming
+
+#### Starting a Stream
+
+1. **Render a video** using the normal process
+2. Once complete, click the **"Go Live on YouTube"** button
+3. **Authenticate** with your YouTube account (first time only)
+4. **Configure stream settings**:
+   - **Title**: Name of your livestream
+   - **Description**: Stream description
+   - **Privacy**: Public, Unlisted, or Private
+5. Click **"Start Streaming"**
+6. Your video will begin streaming to YouTube and **loop infinitely**
+7. Copy the **watch URL** to share your livestream
+
+#### Managing Streams
+
+- **View stream status**: The modal shows real-time streaming status
+- **Watch URL**: Click to open your livestream on YouTube
+- **Stop stream**: Click "Stop Stream" when you want to end the broadcast
+
+### YouTube Streaming Features
+
+- **Infinite Loop**: Videos loop continuously for 24/7 streaming
+- **Auto-Configuration**: Optimized encoding settings for YouTube
+- **DVR Enabled**: Viewers can rewind and fast-forward
+- **Auto-Record**: Streams are automatically saved to your YouTube channel
+- **Multiple Privacy Levels**: Public, Unlisted, or Private broadcasts
+
+### Streaming Technical Details
+
+**Encoding Settings:**
+- Video: H.264, 3000 kbps, YUV420P
+- Audio: AAC, 192 kbps, 44.1 kHz
+- Keyframe Interval: 2 seconds (YouTube recommended)
+- Preset: veryfast (good balance of quality and performance)
+
+**Network Requirements:**
+- Stable upload speed of at least **5 Mbps** recommended
+- Lower speeds may cause buffering for viewers
+
+### YouTube Streaming Troubleshooting
+
+#### "YouTube integration not configured"
+
+- Ensure `youtube_config.json` exists with valid credentials
+- Verify Python dependencies are installed
+- Restart the Flask server
+
+#### "Not authenticated" Error
+
+- Click "Connect YouTube Account" in the streaming modal
+- Complete the OAuth flow
+- Accept the requested permissions
+
+#### "Failed to create YouTube broadcast"
+
+- Check that YouTube Data API v3 is enabled
+- Verify your Google account has YouTube channel access
+- Ensure OAuth credentials are correct
+
+#### Stream Won't Start
+
+- Verify FFmpeg is installed
+- Check internet connection and upload speed
+- Ensure rendered video file exists and is accessible
+
+#### Stream Buffering/Lagging
+
+- Reduce video resolution (use 720p instead of 1080p)
+- Check your internet upload speed
+- Close other applications using bandwidth
+
+### YouTube API Quotas
+
+YouTube Data API has daily quota limits:
+- **Default quota**: 10,000 units per day
+- **Creating a broadcast**: ~1,605 units
+- You can create approximately 6 broadcasts per day with default quota
+
+To increase quota, request a quota increase in Google Cloud Console.
+
 ## Development
 
 ### Project Structure

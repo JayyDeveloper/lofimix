@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-import os, math, shutil, tempfile, uuid, subprocess, pathlib, threading, time, traceback, sys
+import os, math, shutil, tempfile, uuid, subprocess, pathlib, threading, time, traceback, sys, json
 from collections import deque
-from flask import Flask, request, send_file, render_template_string, redirect, url_for, jsonify, send_from_directory, make_response
+from flask import Flask, request, send_file, render_template_string, redirect, url_for, jsonify, send_from_directory, make_response, session
+
+# YouTube API imports (optional - only loaded if credentials exist)
+YOUTUBE_ENABLED = False
+try:
+    from google_auth_oauthlib.flow import Flow
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    YOUTUBE_ENABLED = os.path.exists('youtube_config.json')
+except ImportError:
+    pass
 
 app = Flask(__name__)
 app.secret_key = "lofi-" + str(uuid.uuid4())
@@ -17,6 +28,7 @@ def on_error(e):
 JOBS = {}
 QUEUE = deque()
 RUNNING = None
+STREAMS = {}  # Active YouTube streams: {job_id: {broadcast_id, stream_proc, status, ...}}
 
 TMP_PREFIX = "lofi_"
 TMP_BASE = pathlib.Path(tempfile.gettempdir())
@@ -30,6 +42,160 @@ def cleanup_old_tmp(days=2):
         except Exception:
             pass
 cleanup_old_tmp()
+
+# ===== YouTube Live Streaming Functions =====
+def get_youtube_credentials():
+    """Get YouTube API credentials from session or None"""
+    if not YOUTUBE_ENABLED or 'youtube_credentials' not in session:
+        return None
+    creds_data = session['youtube_credentials']
+    creds = Credentials(**creds_data)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        session['youtube_credentials'] = {
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': creds.scopes
+        }
+    return creds
+
+def create_youtube_broadcast(creds, title, description, privacy='unlisted'):
+    """Create a YouTube live broadcast and return stream key and URL"""
+    try:
+        youtube = build('youtube', 'v3', credentials=creds)
+
+        # Create broadcast
+        broadcast_response = youtube.liveBroadcasts().insert(
+            part='snippet,status,contentDetails',
+            body={
+                'snippet': {
+                    'title': title,
+                    'description': description,
+                    'scheduledStartTime': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                },
+                'status': {
+                    'privacyStatus': privacy,
+                    'selfDeclaredMadeForKids': False
+                },
+                'contentDetails': {
+                    'enableAutoStart': True,
+                    'enableAutoStop': True,
+                    'enableDvr': True,
+                    'enableContentEncryption': False,
+                    'enableEmbed': True,
+                    'recordFromStart': True
+                }
+            }
+        ).execute()
+
+        broadcast_id = broadcast_response['id']
+
+        # Create stream
+        stream_response = youtube.liveStreams().insert(
+            part='snippet,cdn',
+            body={
+                'snippet': {
+                    'title': f'Stream for {title}'
+                },
+                'cdn': {
+                    'frameRate': 'variable',
+                    'ingestionType': 'rtmp',
+                    'resolution': 'variable'
+                }
+            }
+        ).execute()
+
+        stream_id = stream_response['id']
+        stream_name = stream_response['cdn']['ingestionInfo']['streamName']
+        rtmp_url = stream_response['cdn']['ingestionInfo']['ingestionAddress']
+
+        # Bind broadcast to stream
+        youtube.liveBroadcasts().bind(
+            part='id',
+            id=broadcast_id,
+            streamId=stream_id
+        ).execute()
+
+        return {
+            'broadcast_id': broadcast_id,
+            'stream_id': stream_id,
+            'rtmp_url': rtmp_url,
+            'stream_key': stream_name,
+            'watch_url': f'https://youtube.com/watch?v={broadcast_id}'
+        }
+    except Exception as e:
+        print(f"YouTube broadcast creation error: {e}", file=sys.stderr)
+        traceback.print_exc()
+        return None
+
+def start_youtube_stream(video_path, rtmp_url, stream_key, job_id):
+    """Start FFmpeg RTMP stream to YouTube"""
+    full_rtmp = f"{rtmp_url}/{stream_key}"
+
+    cmd = [
+        'ffmpeg',
+        '-re',  # Read input at native frame rate
+        '-stream_loop', '-1',  # Loop video indefinitely
+        '-i', str(video_path),
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-b:v', '3000k',
+        '-maxrate', '3000k',
+        '-bufsize', '6000k',
+        '-pix_fmt', 'yuv420p',
+        '-g', '60',  # Keyframe every 2 seconds at 30fps
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-ar', '44100',
+        '-f', 'flv',
+        full_rtmp
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        STREAMS[job_id]['stream_proc'] = proc
+        STREAMS[job_id]['status'] = 'streaming'
+
+        # Monitor stream in background
+        def monitor():
+            for line in proc.stdout:
+                if job_id in STREAMS:
+                    STREAMS[job_id]['last_output'] = line.strip()
+            proc.wait()
+            if job_id in STREAMS:
+                STREAMS[job_id]['status'] = 'stopped'
+                STREAMS[job_id].pop('stream_proc', None)
+
+        threading.Thread(target=monitor, daemon=True).start()
+        return True
+    except Exception as e:
+        print(f"Stream start error: {e}", file=sys.stderr)
+        return False
+
+def stop_youtube_stream(job_id):
+    """Stop an active YouTube stream"""
+    if job_id not in STREAMS:
+        return False
+
+    stream_info = STREAMS[job_id]
+    proc = stream_info.get('stream_proc')
+
+    if proc:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    stream_info['status'] = 'stopped'
+    stream_info.pop('stream_proc', None)
+    return True
 
 HTML = '''<!doctype html>
 <html>
@@ -177,6 +343,49 @@ input[type="text"],input[type="number"],select,input[type="file"]{width:100%;bor
       <div class="right" style="margin-top:8px;">
         <button class="btn" onclick="cancelSelf()">Cancel</button>
         <a id="downloadLink" class="btn btn-primary" href="#" style="display:none;">Download</a>
+        <button id="youtubeBtn" class="btn" style="display:none;background:linear-gradient(140deg,#ff0000,#cc0000);color:#fff;border:0" onclick="showYoutubeModal()">Go Live on YouTube</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- YouTube Streaming Modal -->
+  <div id="youtubeModal" class="card" style="display:none;">
+    <h3 style="margin:0 0 12px">YouTube Live Streaming</h3>
+    <div id="youtubeAuthSection">
+      <p class="small">Authenticate with YouTube to start streaming</p>
+      <button class="btn btn-primary" onclick="authenticateYouTube()">Connect YouTube Account</button>
+    </div>
+    <div id="youtubeStreamSetup" style="display:none;">
+      <div style="margin-bottom:12px;">
+        <div class="label">Stream Title</div>
+        <input type="text" id="streamTitle" placeholder="My Lofi Stream" />
+      </div>
+      <div style="margin-bottom:12px;">
+        <div class="label">Description</div>
+        <input type="text" id="streamDesc" placeholder="Chill lofi beats to study/relax to" />
+      </div>
+      <div style="margin-bottom:12px;">
+        <div class="label">Privacy</div>
+        <select id="streamPrivacy">
+          <option value="public">Public</option>
+          <option value="unlisted" selected>Unlisted</option>
+          <option value="private">Private</option>
+        </select>
+      </div>
+      <div class="right" style="gap:8px;">
+        <button class="btn" onclick="hideYoutubeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="startYouTubeStream()">Start Streaming</button>
+      </div>
+    </div>
+    <div id="youtubeStreamActive" style="display:none;">
+      <div style="background:rgba(34,197,94,0.1);border:1px solid #22c55e;border-radius:8px;padding:12px;margin-bottom:12px;">
+        <div style="color:#22c55e;font-weight:700;margin-bottom:6px;">Stream is LIVE!</div>
+        <div class="small">Watch URL: <a id="watchUrl" href="#" target="_blank" style="color:#22c55e;">#</a></div>
+        <div class="small" style="margin-top:4px;">Status: <span id="streamStatus">Starting...</span></div>
+      </div>
+      <div class="right">
+        <button class="btn" style="background:#dc2626;color:#fff;" onclick="stopYouTubeStream()">Stop Stream</button>
+        <button class="btn" onclick="hideYoutubeModal()">Close</button>
       </div>
     </div>
   </div>
@@ -505,6 +714,144 @@ def download(job_id):
     j = JOBS.get(job_id)
     if not j or not j.get('outfile'): return 'Not ready',404
     return send_file(j['outfile'], as_attachment=True, download_name=pathlib.Path(j['outfile']).name)
+
+# ===== YouTube Streaming Routes =====
+@app.route('/youtube/auth', methods=['GET'])
+def youtube_auth():
+    """Initiate YouTube OAuth flow"""
+    if not YOUTUBE_ENABLED:
+        return jsonify({'error': 'YouTube integration not configured'}), 400
+
+    flow = Flow.from_client_secrets_file(
+        'youtube_config.json',
+        scopes=['https://www.googleapis.com/auth/youtube.force-ssl'],
+        redirect_uri=url_for('youtube_callback', _external=True)
+    )
+
+    authorization_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent'
+    )
+
+    session['oauth_state'] = state
+    return redirect(authorization_url)
+
+@app.route('/oauth2callback', methods=['GET'])
+def youtube_callback():
+    """Handle YouTube OAuth callback"""
+    if not YOUTUBE_ENABLED:
+        return 'YouTube integration not configured', 400
+
+    state = session.get('oauth_state')
+    flow = Flow.from_client_secrets_file(
+        'youtube_config.json',
+        scopes=['https://www.googleapis.com/auth/youtube.force-ssl'],
+        state=state,
+        redirect_uri=url_for('youtube_callback', _external=True)
+    )
+
+    flow.fetch_token(authorization_response=request.url)
+    creds = flow.credentials
+
+    session['youtube_credentials'] = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'token_uri': creds.token_uri,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': creds.scopes
+    }
+
+    return redirect(url_for('index') + '?youtube_auth=success')
+
+@app.route('/youtube/status', methods=['GET'])
+def youtube_status():
+    """Check if YouTube is authenticated"""
+    creds = get_youtube_credentials()
+    return jsonify({
+        'enabled': YOUTUBE_ENABLED,
+        'authenticated': creds is not None
+    })
+
+@app.route('/youtube/stream/<job_id>', methods=['POST'])
+def create_stream(job_id):
+    """Create a YouTube broadcast and start streaming"""
+    if not YOUTUBE_ENABLED:
+        return jsonify({'error': 'YouTube integration not configured'}), 400
+
+    creds = get_youtube_credentials()
+    if not creds:
+        return jsonify({'error': 'Not authenticated. Please authenticate first.'}), 401
+
+    j = JOBS.get(job_id)
+    if not j or not j.get('outfile'):
+        return jsonify({'error': 'Video not ready'}), 404
+
+    if job_id in STREAMS and STREAMS[job_id].get('status') == 'streaming':
+        return jsonify({'error': 'Stream already active'}), 400
+
+    # Get stream parameters
+    data = request.get_json() or {}
+    title = data.get('title', f"Lofi Mix - {time.strftime('%Y-%m-%d %H:%M')}")
+    description = data.get('description', 'Lofi music mix created with Lofi Mixer Studio')
+    privacy = data.get('privacy', 'unlisted')
+
+    # Create YouTube broadcast
+    broadcast_info = create_youtube_broadcast(creds, title, description, privacy)
+    if not broadcast_info:
+        return jsonify({'error': 'Failed to create YouTube broadcast'}), 500
+
+    # Store stream info
+    STREAMS[job_id] = {
+        'broadcast_id': broadcast_info['broadcast_id'],
+        'stream_id': broadcast_info['stream_id'],
+        'watch_url': broadcast_info['watch_url'],
+        'status': 'starting',
+        'started_at': time.time()
+    }
+
+    # Start streaming in background
+    success = start_youtube_stream(
+        j['outfile'],
+        broadcast_info['rtmp_url'],
+        broadcast_info['stream_key'],
+        job_id
+    )
+
+    if not success:
+        STREAMS.pop(job_id, None)
+        return jsonify({'error': 'Failed to start stream'}), 500
+
+    return jsonify({
+        'success': True,
+        'watch_url': broadcast_info['watch_url'],
+        'broadcast_id': broadcast_info['broadcast_id']
+    })
+
+@app.route('/youtube/stream/<job_id>/stop', methods=['POST'])
+def stop_stream(job_id):
+    """Stop an active YouTube stream"""
+    if job_id not in STREAMS:
+        return jsonify({'error': 'No active stream'}), 404
+
+    success = stop_youtube_stream(job_id)
+    return jsonify({'success': success})
+
+@app.route('/youtube/stream/<job_id>/status', methods=['GET'])
+def stream_status(job_id):
+    """Get stream status"""
+    if job_id not in STREAMS:
+        return jsonify({'active': False})
+
+    stream_info = STREAMS[job_id]
+    return jsonify({
+        'active': True,
+        'status': stream_info.get('status'),
+        'watch_url': stream_info.get('watch_url'),
+        'started_at': stream_info.get('started_at'),
+        'last_output': stream_info.get('last_output', '')
+    })
 
 # ----------------- server -----------------
 if __name__ == '__main__':

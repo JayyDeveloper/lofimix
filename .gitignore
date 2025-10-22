@@ -18,6 +18,9 @@ instance/
 env/
 venv/
 
+# YouTube API credentials (contains secrets)
+youtube_config.json
+
 # IDE
 .vscode/
 .idea/

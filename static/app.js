@@ -2,6 +2,9 @@
 
 let currentJobId = null;
 let pollInterval = null;
+let streamPollInterval = null;
+let youtubeEnabled = false;
+let youtubeAuthenticated = false;
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
@@ -19,6 +22,17 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Poll jobs list periodically
     setInterval(updateJobsList, 3000);
+
+    // Check YouTube authentication status
+    checkYouTubeStatus();
+
+    // Check for YouTube auth success
+    if (params.get('youtube_auth') === 'success') {
+        checkYouTubeStatus();
+        alert('Successfully connected to YouTube!');
+        // Remove the parameter from URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+    }
 });
 
 function initializeForm() {
@@ -182,6 +196,11 @@ function updateProgress(jobId) {
                         downloadLink.href = `/download/${jobId}`;
                         downloadLink.style.display = 'inline-block';
                     }
+                    // Show YouTube button if enabled
+                    const youtubeBtn = document.getElementById('youtubeBtn');
+                    if (youtubeBtn && youtubeEnabled) {
+                        youtubeBtn.style.display = 'inline-block';
+                    }
                 }
 
                 // Stop polling when done
@@ -318,4 +337,149 @@ function cancelJob(jobId) {
             console.error('Error canceling job:', err);
             alert('Failed to cancel job');
         });
+}
+
+// ===== YouTube Streaming Functions =====
+
+function checkYouTubeStatus() {
+    fetch('/youtube/status')
+        .then(res => res.json())
+        .then(data => {
+            youtubeEnabled = data.enabled;
+            youtubeAuthenticated = data.authenticated;
+        })
+        .catch(err => {
+            console.error('Error checking YouTube status:', err);
+        });
+}
+
+function authenticateYouTube() {
+    window.location.href = '/youtube/auth';
+}
+
+function showYoutubeModal() {
+    const modal = document.getElementById('youtubeModal');
+    const authSection = document.getElementById('youtubeAuthSection');
+    const setupSection = document.getElementById('youtubeStreamSetup');
+    const activeSection = document.getElementById('youtubeStreamActive');
+
+    modal.style.display = 'block';
+
+    // Check if already streaming
+    fetch(`/youtube/stream/${currentJobId}/status`)
+        .then(res => res.json())
+        .then(data => {
+            if (data.active) {
+                authSection.style.display = 'none';
+                setupSection.style.display = 'none';
+                activeSection.style.display = 'block';
+                document.getElementById('watchUrl').href = data.watch_url;
+                document.getElementById('watchUrl').textContent = data.watch_url;
+                document.getElementById('streamStatus').textContent = data.status;
+                startStreamPolling();
+            } else if (youtubeAuthenticated) {
+                authSection.style.display = 'none';
+                setupSection.style.display = 'block';
+                activeSection.style.display = 'none';
+            } else {
+                authSection.style.display = 'block';
+                setupSection.style.display = 'none';
+                activeSection.style.display = 'none';
+            }
+        })
+        .catch(err => {
+            console.error('Error checking stream status:', err);
+        });
+}
+
+function hideYoutubeModal() {
+    document.getElementById('youtubeModal').style.display = 'none';
+    if (streamPollInterval) {
+        clearInterval(streamPollInterval);
+        streamPollInterval = null;
+    }
+}
+
+function startYouTubeStream() {
+    const title = document.getElementById('streamTitle').value || 'Lofi Mix Stream';
+    const description = document.getElementById('streamDesc').value || 'Lofi music mix';
+    const privacy = document.getElementById('streamPrivacy').value;
+
+    const btn = event.target;
+    btn.disabled = true;
+    btn.textContent = 'Creating broadcast...';
+
+    fetch(`/youtube/stream/${currentJobId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, description, privacy })
+    })
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                alert('Error: ' + data.error);
+                btn.disabled = false;
+                btn.textContent = 'Start Streaming';
+            } else {
+                // Show active stream section
+                document.getElementById('youtubeStreamSetup').style.display = 'none';
+                document.getElementById('youtubeStreamActive').style.display = 'block';
+                document.getElementById('watchUrl').href = data.watch_url;
+                document.getElementById('watchUrl').textContent = data.watch_url;
+                startStreamPolling();
+            }
+        })
+        .catch(err => {
+            console.error('Error starting stream:', err);
+            alert('Failed to start stream');
+            btn.disabled = false;
+            btn.textContent = 'Start Streaming';
+        });
+}
+
+function stopYouTubeStream() {
+    if (!confirm('Stop the YouTube stream?')) return;
+
+    fetch(`/youtube/stream/${currentJobId}/stop`, { method: 'POST' })
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                alert('Stream stopped successfully');
+                hideYoutubeModal();
+            } else {
+                alert('Failed to stop stream');
+            }
+        })
+        .catch(err => {
+            console.error('Error stopping stream:', err);
+            alert('Failed to stop stream');
+        });
+}
+
+function startStreamPolling() {
+    if (streamPollInterval) {
+        clearInterval(streamPollInterval);
+    }
+
+    streamPollInterval = setInterval(() => {
+        fetch(`/youtube/stream/${currentJobId}/status`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.active) {
+                    const statusEl = document.getElementById('streamStatus');
+                    if (statusEl) {
+                        statusEl.textContent = data.status || 'Unknown';
+                    }
+                } else {
+                    // Stream no longer active
+                    if (streamPollInterval) {
+                        clearInterval(streamPollInterval);
+                        streamPollInterval = null;
+                    }
+                }
+            })
+            .catch(err => {
+                console.error('Error polling stream status:', err);
+            });
+    }, 2000);
 }
