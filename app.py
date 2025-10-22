@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+import os, math, shutil, tempfile, uuid, subprocess, pathlib, threading, time, traceback, sys
+from collections import deque
+from flask import Flask, request, send_file, render_template_string, redirect, url_for, jsonify, send_from_directory, make_response
+
+app = Flask(__name__)
+app.secret_key = "lofi-" + str(uuid.uuid4())
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB uploads
+
+# --- simple error handler so 500s show in the terminal nicely ---
+@app.errorhandler(Exception)
+def on_error(e):
+    print("\n=== Unhandled error ===", file=sys.stderr)
+    traceback.print_exc()
+    return ("Internal Server Error. Check terminal for traceback.", 500, {"Content-Type": "text/plain"})
+
+JOBS = {}
+QUEUE = deque()
+RUNNING = None
+
+TMP_PREFIX = "lofi_"
+TMP_BASE = pathlib.Path(tempfile.gettempdir())
+
+def cleanup_old_tmp(days=2):
+    cutoff = time.time() - days*86400
+    for p in TMP_BASE.glob(f"{TMP_PREFIX}*"):
+        try:
+            if p.is_dir() and p.stat().st_mtime < cutoff:
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+cleanup_old_tmp()
+
+HTML = '''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Lofi Mixer Studio - V4.3.5</title>
+<style>
+:root{--bg1:#0b0c10;--text:#e7e7ea;--muted:#a3a8b3;--card:rgba(255,255,255,0.06);--border:rgba(255,255,255,0.12);--input-bg:rgba(255,255,255,0.05);--input-hover:rgba(255,255,255,0.08)}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto;color:var(--text);background:#0b0c10}
+.container{max-width:1160px;margin:0 auto;padding:28px 20px 80px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;margin-bottom:16px;padding:14px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.label{font-size:13px;color:#cad0db;margin-bottom:6px}
+input[type="text"],input[type="number"],select,input[type="file"]{width:100%;border:1px solid var(--border);background:linear-gradient(180deg,var(--input-bg),rgba(255,255,255,0.03));color:var(--text);border-radius:12px;padding:12px 14px}
+.small{font-size:12px;color:var(--muted)}
+.btn{appearance:none;border:1px solid var(--border);border-radius:12px;padding:12px 16px;font-weight:700;color:var(--text);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));cursor:pointer}
+.btn-primary{color:#fff;border:0;background:linear-gradient(140deg,#7c3aed,#22c55e)}
+.progress{border-radius:12px;overflow:hidden;border:1px solid var(--border);background:rgba(255,255,255,0.05)}
+.bar{height:12px;width:0;background:#22c55e}
+.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:10px 8px;text-align:left;font-size:13px}
+.right{display:flex;gap:8px;justify-content:flex-end}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="card">
+    <h2 style="margin:6px 0 12px 0;">Create video (queued) <span style="font-size:12px;color:#a3a8b3;">V4.3.5</span></h2>
+    <form id="mixForm" action="{{ url_for('enqueue_job') }}" method="post" enctype="multipart/form-data" onsubmit="return startBuild()">
+      <div class="grid">
+        <div>
+          <div class="label">Songs (MP3/M4A/WAV) - select 2 to 10</div>
+          <input id="songInput" type="file" name="songs" accept=".mp3,.m4a,.wav" multiple required />
+          <div id="songList" class="small"></div>
+        </div>
+        <div>
+          <div class="label">Background</div>
+          <div class="grid">
+            <div>
+              <div class="small">Static image (PNG/JPG)</div>
+              <input id="imgInput" type="file" name="image_bg" accept=".png,.jpg,.jpeg" />
+            </div>
+            <div>
+              <div class="small">Loop video (MP4)</div>
+              <input id="vidInput" type="file" name="video_bg" accept=".mp4" />
+              <div class="small">Pick either image OR video</div>
+            </div>
+          </div>
+          <div id="bgPreview" class="small" style="margin-top:6px;"></div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px;">
+        <div>
+          <div class="label">Crossfade (s)</div>
+          <input type="number" name="crossfade" id="crossfade" value="5" min="0" max="30" step="1" required />
+        </div>
+        <div>
+          <div class="label">Target length (minutes)</div>
+          <input type="number" name="target_minutes" id="target_minutes" value="180" min="5" step="5" required />
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px;">
+        <div>
+          <div class="label">Resolution</div>
+          <select name="resolution" id="resolution">
+            <option value="1920x1080" selected>1080p</option>
+            <option value="1280x720">720p</option>
+            <option value="3840x2160">4K</option>
+          </select>
+        </div>
+        <div>
+          <div class="label">Audio bitrate</div>
+          <select name="abitrate" id="abitrate">
+            <option value="192k" selected>192 kbps</option>
+            <option value="256k">256 kbps</option>
+            <option value="320k">320 kbps</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px;">
+        <div>
+          <div class="label">Video preset (speed)</div>
+          <select name="preset" id="preset">
+            <option value="ultrafast" selected>ultrafast</option>
+            <option value="veryfast">veryfast</option>
+            <option value="faster">faster</option>
+            <option value="fast">fast</option>
+            <option value="medium">medium</option>
+          </select>
+        </div>
+        <div>
+          <div class="label">Output filename</div>
+          <input type="text" name="basename" id="basename" value="" required />
+          <div class="small">Auto-filled with date (editable).</div>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;">
+        <h3 style="margin:0 0 8px;">Logo overlay</h3>
+        <div class="grid">
+          <div>
+            <div class="label">PNG (transparent)</div>
+            <input type="file" name="logo_png" id="logo_png" accept=".png" />
+          </div>
+          <div>
+            <div class="label">Position</div>
+            <select name="logo_pos" id="logo_pos">
+              <option value="top-left" selected>Top-left</option>
+              <option value="top-right">Top-right</option>
+              <option value="bottom-left">Bottom-left</option>
+              <option value="bottom-right">Bottom-right</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid" style="margin-top:12px;">
+          <div>
+            <div class="label">Scale width (%)</div>
+            <input type="number" name="logo_scale" id="logo_scale" value="18" min="5" max="60" step="1" />
+          </div>
+          <div>
+            <div class="label">Opacity (%)</div>
+            <input type="number" name="logo_opacity" id="logo_opacity" value="80" min="10" max="100" step="5" />
+          </div>
+        </div>
+      </div>
+
+      <div class="right" style="margin-top:18px;">
+        <button type="reset" class="btn">Reset</button>
+        <button type="submit" class="btn btn-primary" id="buildBtn">Queue Render</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="progressCard" class="card" style="display:none;">
+    <div>
+      <div><b>Status:</b> <span id="stage" style="font-family:monospace">Queued...</span> - ETA: <span id="eta">-</span></div>
+      <div class="progress" style="margin:8px 0 6px;"><div id="bar" class="bar" style="width:0%"></div></div>
+      <div id="logBox" style="white-space:pre-wrap; max-height:220px; overflow:auto; font-family:monospace; font-size:12px; color:#cbd5e1">-</div>
+      <div class="small">Queue position: <span id="qpos">-</span></div>
+      <div class="right" style="margin-top:8px;">
+        <button class="btn" onclick="cancelSelf()">Cancel</button>
+        <a id="downloadLink" class="btn btn-primary" href="#" style="display:none;">Download</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div>
+      <div style="display:flex;align-items:center;justify-content:space-between"><h3>Jobs</h3><span class="small">Single-concurrency encoder</span></div>
+      <table class="table">
+        <thead><tr><th>Job</th><th>Status</th><th>Queue</th><th>Progress</th><th>Output</th><th>Action</th></tr></thead>
+        <tbody id="jobsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>'''
+
+def push_log(job_id, line):
+    j = JOBS[job_id]
+    j.setdefault('log', []).append(line)
+    if len(j['log']) > 2000:
+        j['log'] = j['log'][-1000:]
+
+def run_and_stream(cmd, job_id):
+    j = JOBS[job_id]
+    if j.get('canceled'):
+        return -1
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    j['proc'] = proc
+    for line in proc.stdout:
+        j['progress'] = line.strip()
+        push_log(job_id, line.rstrip('\n'))
+        if j.get('canceled'):
+            try: proc.terminate()
+            except Exception: pass
+            break
+    rc = proc.wait()
+    j.pop('proc', None)
+    return rc
+
+def build_overlay_filter(logo_path, pos, scale_pct, opacity_pct, target_res):
+    try:
+        W_target, H_target = target_res.split("x")
+    except ValueError:
+        W_target, H_target = "1920", "1080"
+    x_expr, y_expr = "10", "10"
+    if pos == "top-right": x_expr, y_expr = "W-w-10", "10"
+    elif pos == "bottom-left": x_expr, y_expr = "10", "H-h-10"
+    elif pos == "bottom-right": x_expr, y_expr = "W-w-10", "H-h-10"
+    scale_expr = f"iw*{scale_pct}/100"
+    alpha = max(0.1, min(1.0, float(opacity_pct) / 100.0))
+    # Make final scale part of the complex graph to avoid -vf conflicts
+    return (
+        f"[1:v]format=rgba,scale=w={scale_expr}:h=-1,colorchannelmixer=aa={alpha}[l2];"
+        f"[0:v][l2]overlay=x={x_expr}:y={y_expr}:format=auto,scale={W_target}:{H_target},setsar=1[vout]"
+    )
+
+def start_next_if_idle():
+    global RUNNING
+    if RUNNING is not None: return
+    if not QUEUE: return
+    job_id = QUEUE.popleft()
+    j = JOBS.get(job_id)
+    if not j or j.get('canceled'):
+        start_next_if_idle(); return
+    RUNNING = job_id
+    j['stage'] = 'Starting...'
+    threading.Thread(target=build_job, args=(job_id,), daemon=True).start()
+
+def end_job(job_id):
+    global RUNNING
+    if RUNNING == job_id:
+        RUNNING = None
+    start_next_if_idle()
+
+def build_job(job_id):
+    j = JOBS[job_id]
+    try:
+        cfg = j['cfg']
+        crossfade = int(cfg['crossfade'])
+        target_minutes = int(cfg['target_minutes'])
+        resolution = cfg['resolution']
+        abitrate = cfg['abitrate']
+        preset = cfg['preset']
+        basename = cfg['basename']
+        tmpdir = pathlib.Path(cfg['tmpdir'])
+        song_paths = [pathlib.Path(p) for p in cfg['songs']]
+        use_video_bg = cfg['use_video_bg']
+        img_path = cfg['img_path']
+        vid_path = cfg['vid_path']
+        logo_png = cfg.get('logo_png')
+        logo_pos = cfg.get('logo_pos','top-left')
+        logo_scale = int(cfg.get('logo_scale','18'))
+        logo_opacity = int(cfg.get('logo_opacity','80'))
+
+        # Step 1: build crossfaded playlist
+        j['stage'] = 'Step 1: Crossfading tracks...'
+        inputs = []
+        for p in song_paths:
+            inputs += ['-i', str(p)]
+        fc_parts, labels = [], []
+        for i in range(len(song_paths)):
+            si = f's{i}'
+            fc_parts.append(f'[{i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{si}]')
+            labels.append(si)
+        prev = labels[0]; idx = 1
+        for i in range(1, len(labels)):
+            curr = labels[i]; out = f'f{idx}'
+            fc_parts.append(f'[{prev}][{curr}]acrossfade=d={crossfade}:c1=tri:c2=tri[{out}]')
+            prev = out; idx += 1
+        final = 'aout'
+        fc_parts.append(f'[{prev}]anull[{final}]')
+        playlist_path = tmpdir/'playlist.mp3'
+        cmd_playlist = ['ffmpeg','-y'] + inputs + [
+            '-filter_complex','; '.join(fc_parts),
+            '-map',f'[{final}]','-ar','44100','-ac','2','-c:a','libmp3lame','-b:a',abitrate, str(playlist_path)
+        ]
+        rc = run_and_stream(cmd_playlist, job_id)
+        if rc != 0: raise RuntimeError('FFmpeg crossfade failed')
+        if j.get('canceled'): raise RuntimeError('Canceled')
+
+        # Step 2: loop playlist to target length
+        j['stage'] = 'Step 2: Looping playlist...'
+        out = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1', str(playlist_path)], capture_output=True, text=True)
+        try: playlist_sec = float(out.stdout.strip())
+        except Exception: playlist_sec = 0.0
+        if playlist_sec <= 0: raise RuntimeError('Could not measure playlist duration')
+        target_sec = max(60, target_minutes * 60)
+        j['target'] = target_sec
+        loops = max(0, math.ceil(target_sec/playlist_sec) - 1)
+        long_path = tmpdir/'long_playlist.mp3'
+        if loops > 0:
+            rc = run_and_stream(['ffmpeg','-y','-stream_loop',str(loops),'-i',str(playlist_path),'-c','copy',str(long_path)], job_id)
+            if rc != 0: raise RuntimeError('FFmpeg audio loop failed')
+        else:
+            shutil.copyfile(playlist_path, long_path)
+        if j.get('canceled'): raise RuntimeError('Canceled')
+
+        # Step 3: render video
+        j['stage'] = 'Step 3: Rendering video...'
+        out_path = tmpdir/f'{basename}.mp4'
+
+        if use_video_bg:
+            if logo_png:
+                filter_complex = build_overlay_filter(logo_png, logo_pos, logo_scale, logo_opacity, resolution)
+                cmd = [
+                    'ffmpeg','-y','-stream_loop','-1','-i',str(vid_path),
+                    '-i',str(logo_png),'-i',str(long_path),
+                    '-filter_complex', filter_complex,
+                    '-map','[vout]','-map','2:a',
+                    '-c:v','libx264','-preset',preset,
+                    '-c:a','aac','-b:a',abitrate,
+                    '-shortest','-pix_fmt','yuv420p',
+                    str(out_path)
+                ]
+            else:
+                cmd = [
+                    'ffmpeg','-y','-stream_loop','-1','-i',str(vid_path),
+                    '-i',str(long_path),
+                    '-c:v','libx264','-preset',preset,
+                    '-c:a','aac','-b:a',abitrate,
+                    '-shortest','-pix_fmt','yuv420p',
+                    '-vf', f'scale={resolution}',
+                    str(out_path)
+                ]
+        else:
+            if logo_png:
+                filter_complex = build_overlay_filter(logo_png, logo_pos, logo_scale, logo_opacity, resolution)
+                cmd = [
+                    'ffmpeg','-y','-loop','1','-i',str(img_path),
+                    '-i',str(logo_png),'-i',str(long_path),
+                    '-filter_complex', filter_complex,
+                    '-map','[vout]','-map','2:a',
+                    '-c:v','libx264','-preset',preset,'-tune','stillimage',
+                    '-c:a','aac','-b:a',abitrate,
+                    '-shortest','-pix_fmt','yuv420p',
+                    str(out_path)
+                ]
+            else:
+                cmd = [
+                    'ffmpeg','-y','-loop','1','-i',str(img_path),
+                    '-i',str(long_path),
+                    '-c:v','libx264','-preset',preset,'-tune','stillimage',
+                    '-c:a','aac','-b:a',abitrate,
+                    '-shortest','-pix_fmt','yuv420p',
+                    '-vf', f'scale={resolution}',
+                    str(out_path)
+                ]
+
+        rc = run_and_stream(cmd, job_id)
+        if rc != 0: raise RuntimeError('FFmpeg video render failed')
+
+        j['stage'] = 'Done'
+        j['done'] = True
+        j['outfile'] = str(out_path)
+    except Exception as e:
+        j['done'] = True
+        j['error'] = str(e)
+    finally:
+        end_job(job_id)
+
+@app.route('/', methods=['GET'])
+def index():
+    resp = make_response(render_template_string(HTML))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+@app.route('/static/<path:filename>')
+def static_files(filename):
+    return send_from_directory('static', filename)
+
+# ---------- MISSING ROUTES (now added) ----------
+@app.route('/enqueue', methods=['POST'])
+def enqueue_job():
+    job_id = uuid.uuid4().hex
+    tmpdir = pathlib.Path(tempfile.mkdtemp(prefix=f"{TMP_PREFIX}{job_id}_"))
+
+    songs = request.files.getlist('songs')
+    if not songs or len(songs) < 2:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return redirect(url_for('index'))
+
+    song_paths = []
+    for i, f in enumerate(songs):
+        ext = pathlib.Path(f.filename).suffix.lower()
+        if ext not in ['.mp3','.m4a','.wav']:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return redirect(url_for('index'))
+        p = tmpdir / f"song{i+1}{ext}"
+        f.save(p)
+        song_paths.append(str(p))
+
+    img_path = None; vid_path = None; use_video_bg = False
+    if 'video_bg' in request.files and request.files['video_bg'].filename:
+        v = request.files['video_bg']
+        if pathlib.Path(v.filename).suffix.lower() != '.mp4':
+            shutil.rmtree(tmpdir, ignore_errors=True); return redirect(url_for('index'))
+        vid_path = str(tmpdir/'loop.mp4'); v.save(vid_path); use_video_bg = True
+    elif 'image_bg' in request.files and request.files['image_bg'].filename:
+        img = request.files['image_bg']; ext = pathlib.Path(img.filename).suffix.lower()
+        if ext not in ['.png','.jpg','.jpeg']:
+            shutil.rmtree(tmpdir, ignore_errors=True); return redirect(url_for('index'))
+        ip = tmpdir/f"image{ext}"; img.save(ip); img_path = str(ip)
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True); return redirect(url_for('index'))
+
+    logo_png = None
+    if 'logo_png' in request.files and request.files['logo_png'].filename:
+        lg = request.files['logo_png']
+        if pathlib.Path(lg.filename).suffix.lower() != '.png':
+            shutil.rmtree(tmpdir, ignore_errors=True); return redirect(url_for('index'))
+        lp = tmpdir/'logo.png'; lg.save(lp); logo_png = str(lp)
+
+    cfg = {
+        'crossfade': request.form.get('crossfade','5'),
+        'target_minutes': request.form.get('target_minutes','180'),
+        'resolution': request.form.get('resolution','1920x1080'),
+        'abitrate': request.form.get('abitrate','192k'),
+        'preset': request.form.get('preset','ultrafast'),
+        'basename': (request.form.get('basename','lofi_mix') or 'lofi_mix').strip(),
+        'tmpdir': str(tmpdir),
+        'songs': song_paths,
+        'use_video_bg': use_video_bg,
+        'img_path': img_path,
+        'vid_path': vid_path,
+        'logo_png': logo_png,
+        'logo_pos': request.form.get('logo_pos','top-left'),
+        'logo_scale': request.form.get('logo_scale','18'),
+        'logo_opacity': request.form.get('logo_opacity','80')
+    }
+
+    JOBS[job_id] = {'id':job_id,'stage':'Queued...','progress':'','log':[],'done':False,'error':None,'outfile':None,'target':None,'canceled':False,'cfg':cfg}
+    QUEUE.append(job_id); start_next_if_idle()
+    return redirect(url_for('index', **{'job': job_id}))
+
+@app.route('/status/<job_id>', methods=['GET'])
+def status(job_id):
+    j = JOBS.get(job_id)
+    if not j: return jsonify({'error':'not found'}),404
+    try: qpos = list(QUEUE).index(job_id) + 1
+    except ValueError: qpos = 0 if RUNNING == job_id else None
+    return jsonify({
+        'stage': j.get('stage',''),
+        'progress': j.get('progress',''),
+        'done': j.get('done',False),
+        'error': j.get('error'),
+        'outfile': True if j.get('outfile') else False,
+        'target': j.get('target'),
+        'canceled': j.get('canceled',False),
+        'log': j.get('log',[]),
+        'queue_pos': qpos
+    })
+
+@app.route('/jobs', methods=['GET'])
+def jobs():
+    rows = []
+    for jid, j in JOBS.items():
+        try: qpos = list(QUEUE).index(jid) + 1
+        except ValueError: qpos = 0 if RUNNING == jid else None
+        rows.append({'id':jid,'stage':j.get('stage',''),'progress':j.get('progress',''),'done':j.get('done',False),'error':j.get('error'),'outfile':True if j.get('outfile') else False,'queue_pos':qpos})
+    def keyfun(r):
+        if RUNNING == r['id']: return (0,0)
+        if r['queue_pos']: return (1,r['queue_pos'])
+        return (2,0)
+    rows.sort(key=keyfun)
+    return jsonify(rows)
+
+@app.route('/cancel/<job_id>', methods=['POST'])
+def cancel(job_id):
+    j = JOBS.get(job_id)
+    if not j: return 'not found',404
+    j['canceled'] = True
+    try: QUEUE.remove(job_id)
+    except ValueError: pass
+    if RUNNING == job_id:
+        proc = j.get('proc')
+        if proc:
+            try: proc.terminate()
+            except Exception: pass
+    return 'ok'
+
+@app.route('/download/<job_id>', methods=['GET'])
+def download(job_id):
+    j = JOBS.get(job_id)
+    if not j or not j.get('outfile'): return 'Not ready',404
+    return send_file(j['outfile'], as_attachment=True, download_name=pathlib.Path(j['outfile']).name)
+
+# ----------------- server -----------------
+if __name__ == '__main__':
+    app.run(debug=True, host='127.0.0.1', port=5050)
