@@ -29,6 +29,7 @@ JOBS = {}
 QUEUE = deque()
 RUNNING = None
 STREAMS = {}  # Active YouTube streams: {job_id: {broadcast_id, stream_proc, status, ...}}
+VIDEOS = {}  # Available videos for streaming: {video_id: {path, name, size, type, created_at}}
 
 TMP_PREFIX = "lofi_"
 TMP_BASE = pathlib.Path(tempfile.gettempdir())
@@ -390,6 +391,75 @@ input[type="text"],input[type="number"],select,input[type="file"]{width:100%;bor
     </div>
   </div>
 
+  <!-- YouTube Live Streaming Section -->
+  <div class="card">
+    <h3 style="margin:0 0 12px;display:flex;align-items:center;gap:8px;">
+      <span style="font-size:24px;">🔴</span> YouTube Live Streaming
+    </h3>
+
+    <div id="youtubeNotConfigured" style="display:none;">
+      <div style="background:rgba(251,191,36,0.1);border:1px solid #fbbf24;border-radius:8px;padding:12px;margin-bottom:12px;">
+        <div style="color:#fbbf24;font-weight:700;margin-bottom:4px;">⚠️ YouTube Not Configured</div>
+        <div class="small">To enable YouTube streaming, follow the setup guide in README.md</div>
+        <div class="small" style="margin-top:4px;">You'll need: Google Cloud Project + YouTube API credentials</div>
+      </div>
+    </div>
+
+    <div id="youtubeConfigured" style="display:none;">
+      <div id="youtubeNotAuthenticated" style="display:none;">
+        <div style="background:rgba(59,130,246,0.1);border:1px solid #3b82f6;border-radius:8px;padding:12px;margin-bottom:12px;">
+          <div style="color:#3b82f6;font-weight:700;margin-bottom:4px;">Connect Your YouTube Account</div>
+          <div class="small" style="margin-bottom:8px;">Authenticate to start streaming your videos</div>
+          <button class="btn btn-primary" onclick="authenticateYouTube()">Connect YouTube Account</button>
+        </div>
+      </div>
+
+      <div id="youtubeAuthenticated" style="display:none;">
+        <div style="background:rgba(34,197,94,0.1);border:1px solid #22c55e;border-radius:8px;padding:8px 12px;margin-bottom:12px;">
+          <span style="color:#22c55e;">✓ YouTube Connected</span>
+        </div>
+
+        <!-- Upload Video for Streaming -->
+        <div style="margin-bottom:16px;">
+          <h4 style="margin:0 0 8px;">Upload Video to Stream</h4>
+          <form id="uploadVideoForm" enctype="multipart/form-data" onsubmit="return uploadVideoForStreaming(event)">
+            <div class="grid">
+              <div>
+                <input type="file" name="stream_video" id="streamVideoInput" accept=".mp4" required />
+                <div class="small">Upload an MP4 file to stream on YouTube</div>
+              </div>
+              <div style="display:flex;align-items:flex-end;">
+                <button type="submit" class="btn btn-primary" style="width:100%;">Upload Video</button>
+              </div>
+            </div>
+          </form>
+          <div id="uploadProgress" style="display:none;margin-top:8px;">
+            <div class="small">Uploading...</div>
+            <div class="progress"><div id="uploadBar" class="bar" style="width:0%"></div></div>
+          </div>
+        </div>
+
+        <!-- Available Videos -->
+        <div>
+          <h4 style="margin:0 0 8px;">Available Videos for Streaming</h4>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Video</th>
+                <th>Size</th>
+                <th>Type</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="streamVideosBody">
+              <tr><td colspan="4" class="small" style="text-align:center;color:var(--muted);">No videos available yet. Render or upload a video above.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <div>
       <div style="display:flex;align-items:center;justify-content:space-between"><h3>Jobs</h3><span class="small">Single-concurrency encoder</span></div>
@@ -583,6 +653,15 @@ def build_job(job_id):
         j['stage'] = 'Done'
         j['done'] = True
         j['outfile'] = str(out_path)
+
+        # Add to available videos for streaming
+        VIDEOS[job_id] = {
+            'path': str(out_path),
+            'name': pathlib.Path(out_path).name,
+            'size': pathlib.Path(out_path).stat().st_size if pathlib.Path(out_path).exists() else 0,
+            'type': 'rendered',
+            'created_at': time.time()
+        }
     except Exception as e:
         j['done'] = True
         j['error'] = str(e)
@@ -774,9 +853,73 @@ def youtube_status():
         'authenticated': creds is not None
     })
 
+@app.route('/youtube/stream/start', methods=['POST'])
+def create_stream_new():
+    """Create a YouTube broadcast and start streaming (new endpoint for video_id)"""
+    if not YOUTUBE_ENABLED:
+        return jsonify({'error': 'YouTube integration not configured'}), 400
+
+    creds = get_youtube_credentials()
+    if not creds:
+        return jsonify({'error': 'Not authenticated. Please authenticate first.'}), 401
+
+    data = request.get_json() or {}
+    video_id = data.get('video_id')
+
+    if not video_id or video_id not in VIDEOS:
+        return jsonify({'error': 'Video not found'}), 404
+
+    video_info = VIDEOS[video_id]
+    video_path = video_info['path']
+
+    if not pathlib.Path(video_path).exists():
+        return jsonify({'error': 'Video file not found'}), 404
+
+    if video_id in STREAMS and STREAMS[video_id].get('status') == 'streaming':
+        return jsonify({'error': 'Stream already active for this video'}), 400
+
+    # Get stream parameters
+    title = data.get('title', f"Lofi Mix - {time.strftime('%Y-%m-%d %H:%M')}")
+    description = data.get('description', 'Lofi music mix created with Lofi Mixer Studio')
+    privacy = data.get('privacy', 'unlisted')
+
+    # Create YouTube broadcast
+    broadcast_info = create_youtube_broadcast(creds, title, description, privacy)
+    if not broadcast_info:
+        return jsonify({'error': 'Failed to create YouTube broadcast'}), 500
+
+    # Store stream info
+    STREAMS[video_id] = {
+        'broadcast_id': broadcast_info['broadcast_id'],
+        'stream_id': broadcast_info['stream_id'],
+        'watch_url': broadcast_info['watch_url'],
+        'status': 'starting',
+        'started_at': time.time(),
+        'video_name': video_info['name']
+    }
+
+    # Start streaming in background
+    success = start_youtube_stream(
+        video_path,
+        broadcast_info['rtmp_url'],
+        broadcast_info['stream_key'],
+        video_id
+    )
+
+    if not success:
+        STREAMS.pop(video_id, None)
+        return jsonify({'error': 'Failed to start stream'}), 500
+
+    return jsonify({
+        'success': True,
+        'watch_url': broadcast_info['watch_url'],
+        'broadcast_id': broadcast_info['broadcast_id'],
+        'video_id': video_id
+    })
+
 @app.route('/youtube/stream/<job_id>', methods=['POST'])
 def create_stream(job_id):
-    """Create a YouTube broadcast and start streaming"""
+    """Create a YouTube broadcast and start streaming (legacy endpoint for job_id)"""
     if not YOUTUBE_ENABLED:
         return jsonify({'error': 'YouTube integration not configured'}), 400
 
@@ -852,6 +995,83 @@ def stream_status(job_id):
         'started_at': stream_info.get('started_at'),
         'last_output': stream_info.get('last_output', '')
     })
+
+@app.route('/videos/upload', methods=['POST'])
+def upload_video():
+    """Upload a video file for streaming"""
+    if 'stream_video' not in request.files:
+        return jsonify({'error': 'No video file provided'}), 400
+
+    video_file = request.files['stream_video']
+    if not video_file.filename:
+        return jsonify({'error': 'No video selected'}), 400
+
+    if not video_file.filename.lower().endswith('.mp4'):
+        return jsonify({'error': 'Only MP4 files are supported'}), 400
+
+    # Create uploads directory if it doesn't exist
+    uploads_dir = pathlib.Path('uploads')
+    uploads_dir.mkdir(exist_ok=True)
+
+    # Generate unique ID and save file
+    video_id = uuid.uuid4().hex
+    filename = f"{video_id}_{video_file.filename}"
+    filepath = uploads_dir / filename
+
+    video_file.save(str(filepath))
+
+    # Add to videos catalog
+    VIDEOS[video_id] = {
+        'path': str(filepath),
+        'name': video_file.filename,
+        'size': filepath.stat().st_size,
+        'type': 'uploaded',
+        'created_at': time.time()
+    }
+
+    return jsonify({
+        'success': True,
+        'video_id': video_id,
+        'name': video_file.filename
+    })
+
+@app.route('/videos/list', methods=['GET'])
+def list_videos():
+    """List all available videos for streaming"""
+    videos_list = []
+    for vid_id, vid_info in VIDEOS.items():
+        # Check if file still exists
+        if pathlib.Path(vid_info['path']).exists():
+            videos_list.append({
+                'id': vid_id,
+                'name': vid_info['name'],
+                'size': vid_info['size'],
+                'type': vid_info['type'],
+                'created_at': vid_info['created_at']
+            })
+
+    # Sort by creation time, newest first
+    videos_list.sort(key=lambda x: x['created_at'], reverse=True)
+    return jsonify(videos_list)
+
+@app.route('/videos/<video_id>', methods=['DELETE'])
+def delete_video(video_id):
+    """Delete an uploaded video"""
+    if video_id not in VIDEOS:
+        return jsonify({'error': 'Video not found'}), 404
+
+    video_info = VIDEOS[video_id]
+
+    # Only allow deleting uploaded videos, not rendered ones
+    if video_info['type'] == 'uploaded':
+        try:
+            pathlib.Path(video_info['path']).unlink(missing_ok=True)
+            del VIDEOS[video_id]
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    else:
+        return jsonify({'error': 'Cannot delete rendered videos'}), 400
 
 # ----------------- server -----------------
 if __name__ == '__main__':

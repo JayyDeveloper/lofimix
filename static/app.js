@@ -25,14 +25,19 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Check YouTube authentication status
     checkYouTubeStatus();
+    updateYouTubeUI();
 
     // Check for YouTube auth success
     if (params.get('youtube_auth') === 'success') {
         checkYouTubeStatus();
+        updateYouTubeUI();
         alert('Successfully connected to YouTube!');
         // Remove the parameter from URL
         window.history.replaceState({}, document.title, window.location.pathname);
     }
+
+    // Refresh video list periodically
+    setInterval(loadAvailableVideos, 5000);
 });
 
 function initializeForm() {
@@ -347,10 +352,35 @@ function checkYouTubeStatus() {
         .then(data => {
             youtubeEnabled = data.enabled;
             youtubeAuthenticated = data.authenticated;
+            updateYouTubeUI();
         })
         .catch(err => {
             console.error('Error checking YouTube status:', err);
         });
+}
+
+function updateYouTubeUI() {
+    const notConfigured = document.getElementById('youtubeNotConfigured');
+    const configured = document.getElementById('youtubeConfigured');
+    const notAuth = document.getElementById('youtubeNotAuthenticated');
+    const authenticated = document.getElementById('youtubeAuthenticated');
+
+    if (!youtubeEnabled) {
+        notConfigured.style.display = 'block';
+        configured.style.display = 'none';
+    } else {
+        notConfigured.style.display = 'none';
+        configured.style.display = 'block';
+
+        if (youtubeAuthenticated) {
+            notAuth.style.display = 'none';
+            authenticated.style.display = 'block';
+            loadAvailableVideos();
+        } else {
+            notAuth.style.display = 'block';
+            authenticated.style.display = 'none';
+        }
+    }
 }
 
 function authenticateYouTube() {
@@ -482,4 +512,196 @@ function startStreamPolling() {
                 console.error('Error polling stream status:', err);
             });
     }, 2000);
+}
+
+// ===== Video Upload and Management =====
+
+function uploadVideoForStreaming(event) {
+    event.preventDefault();
+
+    const form = event.target;
+    const formData = new FormData(form);
+    const uploadProgress = document.getElementById('uploadProgress');
+    const uploadBar = document.getElementById('uploadBar');
+
+    uploadProgress.style.display = 'block';
+    uploadBar.style.width = '0%';
+
+    fetch('/videos/upload', {
+        method: 'POST',
+        body: formData
+    })
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                alert('Upload error: ' + data.error);
+            } else {
+                uploadBar.style.width = '100%';
+                form.reset();
+                setTimeout(() => {
+                    uploadProgress.style.display = 'none';
+                    uploadBar.style.width = '0%';
+                }, 2000);
+                loadAvailableVideos();
+            }
+        })
+        .catch(err => {
+            console.error('Error uploading video:', err);
+            alert('Failed to upload video');
+            uploadProgress.style.display = 'none';
+        });
+
+    return false;
+}
+
+function loadAvailableVideos() {
+    if (!youtubeAuthenticated) return;
+
+    fetch('/videos/list')
+        .then(res => res.json())
+        .then(videos => {
+            const tbody = document.getElementById('streamVideosBody');
+            if (!tbody) return;
+
+            if (videos.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="small" style="text-align:center;color:var(--muted);">No videos available yet. Render or upload a video above.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = '';
+
+            videos.forEach(video => {
+                const tr = document.createElement('tr');
+
+                // Name
+                const tdName = document.createElement('td');
+                tdName.textContent = video.name;
+                tdName.style.fontSize = '12px';
+                tr.appendChild(tdName);
+
+                // Size
+                const tdSize = document.createElement('td');
+                const sizeMB = (video.size / (1024 * 1024)).toFixed(1);
+                tdSize.textContent = `${sizeMB} MB`;
+                tdSize.style.fontSize = '12px';
+                tr.appendChild(tdSize);
+
+                // Type
+                const tdType = document.createElement('td');
+                tdType.textContent = video.type === 'rendered' ? 'Rendered' : 'Uploaded';
+                tdType.style.fontSize = '12px';
+                if (video.type === 'rendered') {
+                    tdType.style.color = '#22c55e';
+                } else {
+                    tdType.style.color = '#3b82f6';
+                }
+                tr.appendChild(tdType);
+
+                // Actions
+                const tdActions = document.createElement('td');
+                tdActions.style.display = 'flex';
+                tdActions.style.gap = '6px';
+
+                const streamBtn = document.createElement('button');
+                streamBtn.textContent = 'Go Live';
+                streamBtn.className = 'btn';
+                streamBtn.style.padding = '6px 12px';
+                streamBtn.style.fontSize = '12px';
+                streamBtn.style.background = 'linear-gradient(140deg,#ff0000,#cc0000)';
+                streamBtn.style.color = '#fff';
+                streamBtn.style.border = '0';
+                streamBtn.onclick = () => streamVideo(video.id, video.name);
+                tdActions.appendChild(streamBtn);
+
+                if (video.type === 'uploaded') {
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.textContent = 'Delete';
+                    deleteBtn.className = 'btn';
+                    deleteBtn.style.padding = '6px 12px';
+                    deleteBtn.style.fontSize = '12px';
+                    deleteBtn.onclick = () => deleteUploadedVideo(video.id);
+                    tdActions.appendChild(deleteBtn);
+                }
+
+                tr.appendChild(tdActions);
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(err => {
+            console.error('Error loading videos:', err);
+        });
+}
+
+function streamVideo(videoId, videoName) {
+    currentJobId = videoId; // Set for modal compatibility
+
+    const title = prompt('Enter stream title:', `Lofi Mix - ${videoName}`);
+    if (!title) return;
+
+    const description = prompt('Enter stream description:', 'Chill lofi beats to study/relax to');
+    if (!description) return;
+
+    const privacy = confirm('Make stream PUBLIC? (Cancel for Unlisted)') ? 'public' : 'unlisted';
+
+    // Show modal with loading state
+    const modal = document.getElementById('youtubeModal');
+    const authSection = document.getElementById('youtubeAuthSection');
+    const setupSection = document.getElementById('youtubeStreamSetup');
+    const activeSection = document.getElementById('youtubeStreamActive');
+
+    modal.style.display = 'block';
+    authSection.style.display = 'none';
+    setupSection.style.display = 'none';
+    activeSection.style.display = 'block';
+
+    document.getElementById('streamStatus').textContent = 'Creating broadcast...';
+    document.getElementById('watchUrl').textContent = 'Please wait...';
+    document.getElementById('watchUrl').href = '#';
+
+    fetch('/youtube/stream/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            video_id: videoId,
+            title: title,
+            description: description,
+            privacy: privacy
+        })
+    })
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                alert('Error: ' + data.error);
+                hideYoutubeModal();
+            } else {
+                document.getElementById('watchUrl').href = data.watch_url;
+                document.getElementById('watchUrl').textContent = data.watch_url;
+                document.getElementById('streamStatus').textContent = 'Starting stream...';
+                currentJobId = data.video_id;
+                startStreamPolling();
+            }
+        })
+        .catch(err => {
+            console.error('Error starting stream:', err);
+            alert('Failed to start stream');
+            hideYoutubeModal();
+        });
+}
+
+function deleteUploadedVideo(videoId) {
+    if (!confirm('Delete this uploaded video?')) return;
+
+    fetch(`/videos/${videoId}`, { method: 'DELETE' })
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                loadAvailableVideos();
+            } else {
+                alert('Error: ' + data.error);
+            }
+        })
+        .catch(err => {
+            console.error('Error deleting video:', err);
+            alert('Failed to delete video');
+        });
 }
